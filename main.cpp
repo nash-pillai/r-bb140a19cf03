@@ -24,7 +24,7 @@ ll number(string_view s, ll cap = LLONG_MAX) {
   for (char c : s) {
     if (c < '0' || c > '9' || n > (cap - (c - '0')) / 10)
       return -1;
-    n = n * 10 + c - '0';
+    n = n * 10 + (c - '0');
   }
   return s.empty() ? -1 : n;
 }
@@ -35,12 +35,15 @@ ll days(int y, unsigned m, unsigned d) {
   unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
   return era * 146097 + (yo * 365 + yo / 4 - yo / 100 + doy) - 719468;
 }
+constexpr ll bad_time = LLONG_MIN;
 ll timestamp(string_view s) {
-  if (s.size() < 5 || s[4] != '-')
-    return number(s);
+  if (s.size() < 5 || s[4] != '-') {
+    ll epoch_ms = number(s);
+    return epoch_ms < 0 ? bad_time : epoch_ms;
+  }
   if ((s.size() != 20 && s.size() != 25) || s[7] != '-' || s[10] != 'T' ||
       s[13] != ':' || s[16] != ':')
-    return -1;
+    return bad_time;
   auto pair_at = [&](int i) {
     unsigned a = static_cast<unsigned char>(s[i]) - '0';
     unsigned b = static_cast<unsigned char>(s[i + 1]) - '0';
@@ -49,24 +52,24 @@ ll timestamp(string_view s) {
   int century = pair_at(0), year = pair_at(2), m = pair_at(5), d = pair_at(8),
       h = pair_at(11), mi = pair_at(14), se = pair_at(17);
   if ((century | year | m | d | h | mi | se) < 0)
-    return -1;
+    return bad_time;
   int y = century * 100 + year;
   int md[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
   if (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))
     md[2] = 29;
   if (m < 1 || m > 12 || d < 1 || d > md[m] || h > 23 || mi > 59 || se > 59)
-    return -1;
+    return bad_time;
   ll off = 0;
   if (s.size() == 20) {
     if (s[19] != 'Z')
-      return -1;
+      return bad_time;
   } else {
     if ((s[19] != '+' && s[19] != '-') || s[22] != ':' ||
         !digits(s.substr(20, 2)) || !digits(s.substr(23, 2)))
-      return -1;
+      return bad_time;
     ll oh = number(s.substr(20, 2)), om = number(s.substr(23, 2));
     if (oh > 23 || om > 59)
-      return -1;
+      return bad_time;
     off = (oh * 60 + om) * 60000 * (s[19] == '+' ? 1 : -1);
   }
   return days(y, m, d) * DAY + (h * 3600 + mi * 60 + se) * 1000 - off;
@@ -91,7 +94,7 @@ bool csv(string_view line, vector<string_view> &out, int count) {
       break;
     a = b + 1;
   }
-  return out.size() == count;
+  return out.size() == size_t(count);
 }
 vector<fs::path> csv_files(const fs::path &p) {
   if (!fs::is_directory(p))
@@ -149,6 +152,38 @@ template <class F> void parallel_jobs(size_t jobs, int threads, F fun) {
     });
   for (auto &worker : pool)
     worker.join();
+}
+struct Range {
+  fs::path file;
+  uint64_t begin, end;
+};
+vector<Range> line_ranges(const fs::path &dir) {
+  constexpr uint64_t block = 8 << 20;
+  vector<Range> ranges;
+  for (const auto &file : csv_files(dir)) {
+    uint64_t bytes = fs::file_size(file);
+    for (uint64_t pos = 0; pos < bytes; pos += block)
+      ranges.push_back({file, pos, min(pos + block, bytes)});
+  }
+  return ranges;
+}
+constexpr size_t person_groups = 128;
+template <class T> using Groups = array<vector<T>, person_groups>;
+
+template <class T>
+vector<T> gather(vector<Groups<T>> &sources, size_t group) {
+  size_t total = 0;
+  for (const auto &source : sources)
+    total += source[group].size();
+  vector<T> result;
+  result.reserve(total);
+  for (auto &source : sources) {
+    auto &batch = source[group];
+    result.insert(result.end(), make_move_iterator(batch.begin()),
+                  make_move_iterator(batch.end()));
+    vector<T>().swap(batch);
+  }
+  return result;
 }
 struct Strings {
   StrMap<int> ids;
@@ -248,6 +283,8 @@ int main(int argc, char **argv) {
     return manifest.substr(p + 1, q - p - 1);
   };
   ll start = timestamp(val("window_start")), end = timestamp(val("window_end"));
+  if (start == bad_time || end == bad_time || start >= end)
+    throw runtime_error("missing or invalid manifest window");
   rows(data + "/links", 2, [&](auto &f) {
     if (f[0].empty() || f[1].empty())
       return;
@@ -267,7 +304,7 @@ int main(int argc, char **argv) {
   channels.push_back("organic");
   rows(data + "/campaigns.csv", 2, [&](auto &f) {
     int c = camps.id(f[0]);
-    if (channels.size() <= c)
+    if (channels.size() <= size_t(c))
       channels.resize(c + 1);
     channels[c] = f[1];
   });
@@ -279,17 +316,7 @@ int main(int argc, char **argv) {
     Strings unlinked;
     vector<int> resolved;
   };
-  struct Range {
-    fs::path file;
-    uint64_t begin, end;
-  };
-  vector<Range> ranges;
-  constexpr uint64_t block = 8 << 20;
-  for (const auto &file : csv_files(data + "/events")) {
-    uint64_t bytes = fs::file_size(file);
-    for (uint64_t pos = 0; pos < bytes; pos += block)
-      ranges.push_back({file, pos, min(pos + block, bytes)});
-  }
+  auto ranges = line_ranges(data + "/events");
   vector<Reader> readers(threads);
   vector<int> canonical(parent.size());
   for (size_t i = 0; i < parent.size(); ++i)
@@ -333,8 +360,8 @@ int main(int argc, char **argv) {
     reader.unlinked = {};
   }
   checkpoint("event parse");
-  array<vector<Event>, partitions> surviving;
-  parallel_jobs(partitions, threads, [&](int, size_t part) {
+  vector<Groups<Event>> surviving(threads);
+  parallel_jobs(partitions, threads, [&](int worker, size_t part) {
     size_t count = 0;
     for (auto &reader : readers)
       count += reader.records[part].size();
@@ -352,8 +379,7 @@ int main(int argc, char **argv) {
     }
     sort(records.begin(), records.end(),
          [](auto &a, auto &b) { return a.key < b.key; });
-    auto &result = surviving[part];
-    result.reserve(count);
+    auto &groups = surviving[worker];
     for (size_t i = 0; i < count;) {
       size_t winner = i++;
       while (i < count && records[i].key == records[winner].key) {
@@ -361,113 +387,138 @@ int main(int argc, char **argv) {
           winner = i;
         ++i;
       }
-      if (records[winner].e.user >= 0)
-        result.push_back(records[winner].e);
+      const auto &event = records[winner].e;
+      if (event.user >= 0)
+        groups[event.user % person_groups].push_back(event);
     }
   });
   checkpoint("event dedup");
-  size_t count = 0;
-  for (const auto &part : surviving)
-    count += part.size();
-  vector<Event> events;
-  events.reserve(count);
-  for (auto &part : surviving) {
-    events.insert(events.end(), part.begin(), part.end());
-    vector<Event>().swap(part);
-  }
-  sort(events.begin(), events.end(),
-       [](auto &a, auto &b) { return tie(a.user, a.ts) < tie(b.user, b.ts); });
-  cerr << "valid events " << events.size() << "\n";
-  checkpoint("events sorted");
-  vector<Click> clicks;
-  rows(data + "/clicks", 4, [&](auto &f) {
-    if (f[0].empty())
-      return;
-    ll ts = timestamp(f[3]);
-    auto c = camps.ids.find(f[2]);
-    if (f[1].empty() || ts < start - WEEK || ts >= end ||
-        c == camps.ids.end() || c->second == organic)
-      return;
-    clicks.push_back({ts, root(uid(f[1])), c->second, string(f[0])});
+  canonical.resize(parent.size());
+  for (size_t i = 0; i < parent.size(); ++i)
+    canonical[i] = root(i);
+  vector<Groups<Click>> click_batches(threads);
+  ranges = line_ranges(data + "/clicks");
+  parallel_jobs(ranges.size(), threads, [&](int worker, size_t job) {
+    const auto &range = ranges[job];
+    read_range(range.file, range.begin, range.end, 4, [&](auto &f) {
+      if (f[0].empty() || f[1].empty())
+        return;
+      ll ts = timestamp(f[3]);
+      auto c = as_const(camps.ids).find(f[2]);
+      if (ts < start - WEEK || ts >= end || c == camps.ids.end() ||
+          c->second == organic)
+        return;
+      // A previously unseen, unlinked user has no events to credit or assist.
+      auto person = as_const(users.ids).find(f[1]);
+      if (person == users.ids.end())
+        return;
+      int user = canonical[person->second];
+      click_batches[worker][user % person_groups].push_back(
+          {ts, user, c->second, string(f[0])});
+    });
   });
-  sort(clicks.begin(), clicks.end(), [](auto &a, auto &b) {
-    if (a.user != b.user)
-      return a.user < b.user;
-    if (a.ts != b.ts)
-      return a.ts < b.ts;
-    return a.id > b.id;
-  });
-  // Copies have identical values and are adjacent in this total ordering.
-  clicks.erase(unique(clicks.begin(), clicks.end(), [](auto &a, auto &b) {
-    return a.id == b.id;
-  }), clicks.end());
-  checkpoint("clicks sorted");
-  map<pair<int, ll>, Agg> ca;
+  checkpoint("click parse");
+  vector<map<pair<int, ll>, Agg>> totals(threads);
   fs::create_directories(out + "/user_daily");
   fs::create_directories(out + "/campaign_daily");
   ofstream u(out + "/user_daily/raw.csv"), c(out + "/campaign_daily/raw.csv");
   u << "user_id,day,sessions,events,revenue_cents,top_category\n";
   c << "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,"
        "assisted_sessions\n";
-  size_t ei = 0, ci = 0;
-  while (ei < events.size()) {
-    int user = events[ei].user;
-    size_t ee = ei;
-    while (ee < events.size() && events[ee].user == user)
-      ee++;
-    while (ci < clicks.size() && clicks[ci].user < user)
-      ci++;
-    size_t ce = ci;
-    while (ce < clicks.size() && clicks[ce].user == user)
-      ce++;
-    size_t left = ci, right = ci;
-    unordered_map<int, int> active;
-    map<ll, Agg> ua;
-    while (ei < ee) {
-      ll sessionStart = events[ei].ts, day = sessionStart / DAY;
-      while (right < ce && clicks[right].ts <= sessionStart)
-        active[clicks[right++].camp]++;
-      while (left < right && clicks[left].ts < sessionStart - WEEK) {
-        int camp = clicks[left++].camp;
-        if (--active[camp] == 0)
-          active.erase(camp);
+  mutex output_lock;
+  atomic<size_t> valid_events{0};
+  parallel_jobs(person_groups, threads, [&](int worker, size_t group) {
+    auto events = gather(surviving, group);
+    auto clicks = gather(click_batches, group);
+    valid_events.fetch_add(events.size(), memory_order_relaxed);
+    sort(events.begin(), events.end(),
+         [](auto &a, auto &b) { return tie(a.user, a.ts) < tie(b.user, b.ts); });
+    sort(clicks.begin(), clicks.end(), [](auto &a, auto &b) {
+      if (a.user != b.user)
+        return a.user < b.user;
+      if (a.ts != b.ts)
+        return a.ts < b.ts;
+      return a.id > b.id;
+    });
+    // Identical copies are adjacent. Descending ID leaves the smallest tie last.
+    clicks.erase(unique(clicks.begin(), clicks.end(), [](auto &a, auto &b) {
+      return a.id == b.id;
+    }), clicks.end());
+    auto &ca = totals[worker];
+    ostringstream user_rows;
+    size_t ei = 0, ci = 0;
+    while (ei < events.size()) {
+      int user = events[ei].user;
+      size_t ee = ei;
+      while (ee < events.size() && events[ee].user == user)
+        ee++;
+      while (ci < clicks.size() && clicks[ci].user < user)
+        ci++;
+      size_t ce = ci;
+      while (ce < clicks.size() && clicks[ce].user == user)
+        ce++;
+      size_t left = ci, right = ci;
+      unordered_map<int, int> active;
+      map<ll, Agg> ua;
+      while (ei < ee) {
+        ll sessionStart = events[ei].ts, day = sessionStart / DAY - (sessionStart % DAY < 0);
+        while (right < ce && clicks[right].ts <= sessionStart)
+          active[clicks[right++].camp]++;
+        while (left < right && clicks[left].ts < sessionStart - WEEK) {
+          int camp = clicks[left++].camp;
+          if (--active[camp] == 0)
+            active.erase(camp);
+        }
+        int credit = right > left ? clicks[right - 1].camp : organic;
+        auto &us = ua[day];
+        auto &cs = ca[{credit, day}];
+        us.sessions++;
+        cs.sessions++;
+        bool purchase = false;
+        ll prev = events[ei].ts;
+        do {
+          auto &e = events[ei++];
+          us.events++;
+          us.revenue += e.price;
+          cs.revenue += e.price;
+          if (e.price) {
+            purchase = true;
+            us.cat[e.cat] += e.price;
+          }
+          prev = e.ts;
+        } while (ei < ee && events[ei].ts - prev <= 1800000);
+        cs.purchasing += purchase;
+        for (auto &[camp, n] : active)
+          ca[{camp, day}].assist++;
       }
-      int credit = right > left ? clicks[right - 1].camp : organic;
-      auto &us = ua[day];
-      auto &cs = ca[{credit, day}];
-      us.sessions++;
-      cs.sessions++;
-      bool purchase = false;
-      ll prev = events[ei].ts;
-      do {
-        auto &e = events[ei++];
-        us.events++;
-        us.revenue += e.price;
-        cs.revenue += e.price;
-        if (e.price) {
-          purchase = true;
-          us.cat[e.cat] += e.price;
-        }
-        prev = e.ts;
-      } while (ei < ee && events[ei].ts - prev <= 1800000);
-      cs.purchasing += purchase;
-      for (auto &[camp, n] : active)
-        ca[{camp, day}].assist++;
+      for (auto &[day, a] : ua) {
+        int top = -1;
+        ll revenue = -1;
+        for (auto &[cat, r] : a.cat)
+          if (r > revenue ||
+              (r == revenue && cats.names[cat] < cats.names[top])) {
+            top = cat;
+            revenue = r;
+          }
+        user_rows << quote(users.names[user]) << ',' << day << ',' << a.sessions << ','
+          << a.events << ',' << a.revenue << ','
+          << (top < 0 ? "" : quote(cats.names[top])) << '\n';
+      }
+      ci = ce;
     }
-    for (auto &[day, a] : ua) {
-      int top = -1;
-      ll revenue = -1;
-      for (auto &[cat, r] : a.cat)
-        if (r > revenue ||
-            (r == revenue && cats.names[cat] < cats.names[top])) {
-          top = cat;
-          revenue = r;
-        }
-      u << quote(users.names[user]) << ',' << day << ',' << a.sessions << ','
-        << a.events << ',' << a.revenue << ','
-        << (top < 0 ? "" : quote(cats.names[top])) << '\n';
+    lock_guard lock(output_lock);
+    u << user_rows.view();
+  });
+  cerr << "valid events " << valid_events.load() << "\n";
+  map<pair<int, ll>, Agg> ca;
+  for (const auto &local : totals) {
+    for (const auto &[key, a] : local) {
+      auto &total = ca[key];
+      total.sessions += a.sessions;
+      total.purchasing += a.purchasing;
+      total.revenue += a.revenue;
+      total.assist += a.assist;
     }
-    ci = ce;
   }
   for (auto &[key, a] : ca) {
     auto [camp, day] = key;
@@ -475,6 +526,10 @@ int main(int argc, char **argv) {
       << ',' << a.sessions << ',' << a.purchasing << ',' << a.revenue << ','
       << a.assist << '\n';
   }
+  u.close();
+  c.close();
+  if (!u || !c)
+    throw runtime_error("cannot write daily outputs");
   cerr << "core seconds "
        << chrono::duration<double>(chrono::steady_clock::now() - begin).count()
        << "\n";
