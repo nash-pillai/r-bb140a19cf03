@@ -1,0 +1,6 @@
+.venv
+fixtures
+reference
+__pycache__
+*.parquet
+*.csv

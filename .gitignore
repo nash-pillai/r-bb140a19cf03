@@ -1,0 +1,9 @@
+.venv/
+pipeline
+pipeline.*
+!pipeline.py
+__pycache__/
+*.parquet
+dev/
+output/
+scratch/
