@@ -277,6 +277,14 @@ class UserIndex {
 public:
   vector<string> names;
 
+  void apply_roots(const vector<int> &roots) {
+    for (auto &slot : slots)
+      if (slot.id >= 0)
+        slot.id = roots[slot.id];
+    for (auto &entry : other)
+      entry.second = roots[entry.second];
+  }
+
   int find(string_view name) const {
     uint64_t key;
     if (packed_key(name, key))
@@ -346,7 +354,15 @@ class EventKeys {
 public:
   uint64_t get(string_view s) {
     constexpr uint64_t tag = uint64_t(1) << 63;
-    if (s.front() == 'e' && s.size() <= 9) {
+    if (s.front() == 'e' && s.size() == 9) {
+      uint64_t bits;
+      memcpy(&bits, s.data() + 1, sizeof(bits));
+      // A zero suffix byte requires the length-aware string fallback.
+      constexpr uint64_t ones = 0x0101010101010101ULL;
+      const bool has_zero = ((bits - ones) & ~bits & (ones << 7)) != 0;
+      if (!(bits & tag) && !has_zero)
+        return bits;
+    } else if (s.front() == 'e' && s.size() < 9) {
       auto suffix = s.substr(1);
       uint64_t bits = 0;
       memcpy(&bits, suffix.data(), suffix.size());
@@ -419,9 +435,51 @@ struct Click {
   int user, camp;
 };
 struct Agg {
-  ll sessions = 0, events = 0, revenue = 0, purchasing = 0, assist = 0;
+  ll sessions = 0, events = 0, revenue = 0;
   map<int, ll> cat;
 };
+
+struct CampaignAgg {
+  ll sessions = 0, revenue = 0, purchasing = 0, assist = 0;
+};
+
+ll utc_day(ll timestamp) { return timestamp / DAY - (timestamp % DAY < 0); }
+
+class CampaignTotals {
+  ll first_day;
+  size_t days;
+  vector<CampaignAgg> dense;
+  map<pair<int, ll>, CampaignAgg> sparse;
+
+public:
+  CampaignTotals(size_t campaigns, ll first, ll last)
+      : first_day(first), days(last - first + 1) {
+    // Avoid scaling allocations with a disproportionately wide date window.
+    constexpr size_t max_dense_entries = 131072;
+    if (campaigns <= max_dense_entries / days)
+      dense.resize(campaigns * days);
+  }
+
+  CampaignAgg &at(int campaign, ll day) {
+    if (dense.empty())
+      return sparse[{campaign, day}];
+    return dense[size_t(campaign) * days + (day - first_day)];
+  }
+
+  template <class F> void for_each(F combine) const {
+    if (dense.empty()) {
+      for (const auto &[key, total] : sparse)
+        combine(key, total);
+      return;
+    }
+    for (size_t i = 0; i < dense.size(); ++i) {
+      const auto &total = dense[i];
+      if (total.sessions || total.assist)
+        combine(pair{int(i / days), first_day + ll(i % days)}, total);
+    }
+  }
+};
+
 string quote(const string &s) { return "\"" + s + "\""; }
 template <class Time>
 void process(const string &data, const string &out, ll start, ll end,
@@ -469,9 +527,12 @@ void process(const string &data, const string &out, ll start, ll end,
   };
   auto ranges = line_ranges(data + "/events");
   vector<Reader> readers(threads);
-  vector<int> canonical(parent.size());
+  // Publish the canonical IDs in the lookup table once links are complete.
+  // Any later insertion is an unlinked singleton with its own name index.
   for (size_t i = 0; i < parent.size(); ++i)
-    canonical[i] = root(i);
+    parent[i] = root(i);
+  users.apply_roots(parent);
+  vector<int>().swap(parent);
   EventKeys keys;
   parallel_jobs(ranges.size(), threads, [&](int worker, size_t job) {
     auto &reader = readers[worker];
@@ -489,7 +550,7 @@ void process(const string &data, const string &out, ll start, ll end,
           !f[5].empty() && (!purchase || price >= 1) &&
           (ingest <= ts || uint64_t(ingest) - uint64_t(ts) <= uint64_t(DAY))) {
         const int known = users.find(f[1]);
-        e.user = known < 0 ? -2 - reader.unlinked.id(f[1]) : canonical[known];
+        e.user = known < 0 ? -2 - reader.unlinked.id(f[1]) : known;
         e.ts = static_cast<Time>(ts - origin);
         e.price = price;
         if (purchase) {
@@ -499,14 +560,33 @@ void process(const string &data, const string &out, ll start, ll end,
       }
       // Invalid but well-formed copies still participate in deduplication.
       auto key = keys.get(f[0]);
-      auto part = Hash{}(f[0]) % partitions;
+      // SplitMix64 finalizer spreads both packed and interned IDs across readers'
+      // buckets. Keep the exact key for equality inside each bucket.
+      uint64_t h = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ULL;
+      h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
+      auto part = (h ^ (h >> 31)) % partitions;
       reader.records[part].push_back({key, ingest, e});
     });
   });
-  for (auto &reader : readers) {
+  // Establish IDs for one reader, then all remaining readers can resolve
+  // overlaps concurrently while the global index is immutable.
+  auto seed = max_element(readers.begin(), readers.end(), [](const Reader &a, const Reader &b) {
+    return a.unlinked.names.size() < b.unlinked.names.size();
+  });
+  seed->resolved.reserve(seed->unlinked.names.size());
+  for (const auto &name : seed->unlinked.names)
+    seed->resolved.push_back(users.id(name));
+  seed->unlinked = {};
+  parallel_jobs(readers.size(), threads, [&](int, size_t i) {
+    auto &reader = readers[i];
     reader.resolved.reserve(reader.unlinked.names.size());
-    for (auto &name : reader.unlinked.names)
-      reader.resolved.push_back(uid(name));
+    for (const auto &name : reader.unlinked.names)
+      reader.resolved.push_back(users.find(name));
+  });
+  for (auto &reader : readers) {
+    for (size_t i = 0; i < reader.unlinked.names.size(); ++i)
+      if (reader.resolved[i] < 0)
+        reader.resolved[i] = users.id(reader.unlinked.names[i]);
     reader.unlinked = {};
   }
   checkpoint("event parse");
@@ -553,9 +633,6 @@ void process(const string &data, const string &out, ll start, ll end,
     }
   });
   checkpoint("event dedup");
-  canonical.resize(parent.size());
-  for (size_t i = 0; i < parent.size(); ++i)
-    canonical[i] = root(i);
   vector<Groups<Click>> click_batches(threads);
   ClickIds click_ids(threads);
   ranges = line_ranges(data + "/clicks");
@@ -573,13 +650,15 @@ void process(const string &data, const string &out, ll start, ll end,
       const int person = users.find(f[1]);
       if (person < 0)
         return;
-      int user = canonical[person];
-      click_batches[worker][user % person_groups].push_back(
-          {ts, click_ids.encode(f[0], worker), user, c->second});
+      click_batches[worker][person % person_groups].push_back(
+          {ts, click_ids.encode(f[0], worker), person, c->second});
     });
   });
   checkpoint("click parse");
-  vector<map<pair<int, ll>, Agg>> totals(threads);
+  vector<CampaignTotals> totals;
+  totals.reserve(threads);
+  for (int i = 0; i < threads; ++i)
+    totals.emplace_back(camps.names.size(), utc_day(start), utc_day(end - 1));
   fs::create_directories(out + "/user_daily");
   fs::create_directories(out + "/campaign_daily");
   ofstream u(out + "/user_daily/raw.csv"), c(out + "/campaign_daily/raw.csv");
@@ -629,7 +708,7 @@ void process(const string &data, const string &out, ll start, ll end,
       unordered_map<int, int> active;
       map<ll, Agg> ua;
       while (ei < ee) {
-        ll sessionStart = origin + ll(events[ei].ts), day = sessionStart / DAY - (sessionStart % DAY < 0);
+        ll sessionStart = origin + ll(events[ei].ts), day = utc_day(sessionStart);
         while (right < ce && clicks[right].ts <= sessionStart)
           active[clicks[right++].camp]++;
         while (left < right && clicks[left].ts < sessionStart - WEEK) {
@@ -639,7 +718,7 @@ void process(const string &data, const string &out, ll start, ll end,
         }
         int credit = right > left ? clicks[right - 1].camp : organic;
         auto &us = ua[day];
-        auto &cs = ca[{credit, day}];
+        auto &cs = ca.at(credit, day);
         us.sessions++;
         cs.sessions++;
         bool purchase = false;
@@ -657,7 +736,7 @@ void process(const string &data, const string &out, ll start, ll end,
         } while (ei < ee && uint64_t(events[ei].ts) - uint64_t(prev) <= 1800000);
         cs.purchasing += purchase;
         for (auto &[camp, n] : active)
-          ca[{camp, day}].assist++;
+          ca.at(camp, day).assist++;
       }
       for (auto &[day, a] : ua) {
         int top = -1;
@@ -678,15 +757,15 @@ void process(const string &data, const string &out, ll start, ll end,
     u << user_rows.view();
   });
   cerr << "valid events " << valid_events.load() << "\n";
-  map<pair<int, ll>, Agg> ca;
+  map<pair<int, ll>, CampaignAgg> ca;
   for (const auto &local : totals) {
-    for (const auto &[key, a] : local) {
+    local.for_each([&](auto key, const CampaignAgg &a) {
       auto &total = ca[key];
       total.sessions += a.sessions;
       total.purchasing += a.purchasing;
       total.revenue += a.revenue;
       total.assist += a.assist;
-    }
+    });
   }
   for (auto &[key, a] : ca) {
     auto [camp, day] = key;
