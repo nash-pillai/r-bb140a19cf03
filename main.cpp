@@ -583,15 +583,22 @@ public:
   }
 } users;
 
-template <class Time> struct EventRecord {
+struct PackedPurchase {
+  uint32_t price : 24 = 0, cat : 8 = 0;
+};
+struct WidePurchase {
+  uint32_t price = 0, cat = 0;
+};
+template <class Time, class Purchase> struct EventRecord {
   Time ts = 0;
-  int user = -1, cat = 0, price = 0;
+  int user = -1;
+  Purchase purchase;
 };
 
 // A person group fixes the low bits of the user ID. Count only the user
 // slots belonging to this group, then scatter straight from the dedup batches.
+template <class Event>
 struct CompactEventOrder {
-  using Event = EventRecord<uint32_t>;
   vector<size_t> ends;
   vector<Event> ordered, scratch;
 
@@ -689,10 +696,27 @@ public:
     return other.emplace(string(s), tag | other.size()).first->second;
   }
 };
-template <class Time> struct KeptRecord {
+template <class Event> struct KeptRecord {
   uint64_t key;
-  ll ingest;
-  EventRecord<Time> e;
+  uint32_t ingest;
+  Event e;
+};
+using CompactEvent = EventRecord<uint32_t, PackedPurchase>;
+static_assert(sizeof(CompactEvent) == 12 && sizeof(KeptRecord<CompactEvent>) == 24);
+
+// Common codes are monotone UTC seconds centered on the window start. Reserve
+// one code for exact millisecond values, including the parser's bad_time.
+struct IngestClock {
+  static constexpr uint32_t exceptional = UINT32_MAX;
+  ll first_second;
+  explicit IngestClock(ll start) : first_second(start / 1000 - INT32_MAX) {}
+
+  uint32_t encode(ll ms) const {
+    ll seconds = ms / 1000;
+    uint64_t offset = uint64_t(seconds - first_second);
+    return ms % 1000 == 0 && offset < exceptional ? uint32_t(offset) : exceptional;
+  }
+  ll decode(uint32_t offset) const { return (first_second + offset) * 1000; }
 };
 
 class ClickIds {
@@ -813,11 +837,12 @@ void finish_parts(const fs::path &folder, int count) {
       fs::remove(e.path());
   }
 }
-template <class Time>
+template <class Time, class Purchase>
 void process(const string &data, const string &out, ll start, ll end,
-             chrono::steady_clock::time_point begin) {
-  using Event = EventRecord<Time>;
-  using Kept = KeptRecord<Time>;
+             chrono::steady_clock::time_point begin, const StrMap<int> &products, int unknown) {
+  using Event = EventRecord<Time, Purchase>;
+  using Kept = KeptRecord<Event>;
+  const IngestClock clock(start);
   // Valid events have already passed the half-open window check on absolute time.
   const ll origin = is_same_v<Time, uint32_t> ? start : 0;
   auto checkpoint = [&](const char *label) {
@@ -828,10 +853,6 @@ void process(const string &data, const string &out, ll start, ll end,
   };
   const int threads = clamp(getenv("NCPU") ? atoi(getenv("NCPU")) : 8, 1, 8);
   users.build_links(data + "/links", threads);
-  StrMap<int> products;
-  int unknown = cats.id("unknown");
-  rows<2>(data + "/products.csv",
-       [&](auto &f) { products[string(f[0])] = cats.id(f[1]); });
   vector<string> channels;
   int organic = camps.id("organic");
   channels.push_back("organic");
@@ -845,6 +866,8 @@ void process(const string &data, const string &out, ll start, ll end,
   constexpr size_t partitions = 256;
   struct Reader {
     array<vector<Kept>, partitions> records;
+    // Indices stay valid as the record vectors grow during parsing.
+    array<vector<pair<size_t, ll>>, partitions> exceptions;
     UserIndex unlinked;
     vector<int> resolved;
   };
@@ -869,10 +892,10 @@ void process(const string &data, const string &out, ll start, ll end,
         const int known = users.find(f[1]);
         e.user = known < 0 ? -2 - reader.unlinked.id(f[1]) : known;
         e.ts = static_cast<Time>(ts - origin);
-        e.price = price;
         if (purchase) {
-          auto product = as_const(products).find(f[5]);
-          e.cat = product == products.end() ? unknown : product->second;
+          auto product = products.find(f[5]);
+          e.purchase.price = price;
+          e.purchase.cat = product == products.end() ? unknown : product->second;
         }
       }
       // Invalid but well-formed copies still participate in deduplication.
@@ -882,7 +905,11 @@ void process(const string &data, const string &out, ll start, ll end,
       uint64_t h = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ULL;
       h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
       auto part = (h ^ (h >> 31)) % partitions;
-      reader.records[part].push_back({key, ingest, e});
+      auto &batch = reader.records[part];
+      uint32_t code = clock.encode(ingest);
+      if (code == IngestClock::exceptional)
+        reader.exceptions[part].emplace_back(batch.size(), ingest);
+      batch.push_back({key, code, e});
     });
   });
   // Establish IDs for one reader, then all remaining readers can resolve
@@ -914,6 +941,20 @@ void process(const string &data, const string &out, ll start, ll end,
       count += reader.records[part].size();
     if (count == 0)
       return;
+    // Batches now have stable addresses. Only exceptional duplicate comparisons
+    // need this table. The normal case compares the two 32-bit codes directly.
+    unordered_map<const Kept *, ll> exact;
+    for (auto &reader : readers)
+      for (auto [index, ms] : reader.exceptions[part])
+        exact.emplace(&reader.records[part][index], ms);
+    auto earlier = [&](const Kept &a, const Kept &b) {
+      if (a.ingest != IngestClock::exceptional && b.ingest != IngestClock::exceptional)
+        return a.ingest < b.ingest;
+      auto millis = [&](const Kept &r) {
+        return r.ingest == IngestClock::exceptional ? exact.at(&r) : clock.decode(r.ingest);
+      };
+      return millis(a) < millis(b);
+    };
     // Each slot points into an immutable-size reader batch. On a duplicate
     // invalidate the loser, even when the winning copy is itself invalid.
     const size_t capacity = bit_ceil(count + count / 3 + 1);
@@ -927,7 +968,7 @@ void process(const string &data, const string &out, ll start, ll end,
         Kept *&winner = slots[i];
         if (!winner) {
           winner = &record;
-        } else if (record.ingest < winner->ingest) {
+        } else if (earlier(record, *winner)) {
           winner->e.user = -1;
           winner = &record;
         } else {
@@ -983,7 +1024,7 @@ void process(const string &data, const string &out, ll start, ll end,
     user_files.push_back(make_unique<DailyWriter>(
         part_name(out + "/user_daily", i).string() + ".tmp", true));
   atomic<size_t> valid_events{0};
-  vector<CompactEventOrder> compact_order(threads);
+  vector<CompactEventOrder<Event>> compact_order(threads);
   parallel_jobs(person_groups, threads, [&](int worker, size_t group) {
     auto events = [&] {
       if constexpr (is_same_v<Time, uint32_t>)
@@ -1044,11 +1085,11 @@ void process(const string &data, const string &out, ll start, ll end,
         do {
           auto &e = events[ei++];
           us.events++;
-          us.revenue += e.price;
-          cs.revenue += e.price;
-          if (e.price) {
+          us.revenue += e.purchase.price;
+          cs.revenue += e.purchase.price;
+          if (e.purchase.price) {
             purchase = true;
-            us.cat[e.cat] += e.price;
+            us.cat[e.purchase.cat] += e.purchase.price;
           }
           prev = e.ts;
         } while (ei < ee && uint64_t(events[ei].ts) - uint64_t(prev) <= 1800000);
@@ -1120,8 +1161,19 @@ int main(int argc, char **argv) {
     throw runtime_error("missing or invalid manifest window");
   // Unsigned subtraction also covers a window spanning the epoch.
   const uint64_t span = uint64_t(end) - uint64_t(start);
+  StrMap<int> products;
+  int unknown = cats.id("unknown");
+  rows<2>(data + "/products.csv",
+      [&](auto &f) { products[string(f[0])] = cats.id(f[1]); });
+  auto run = [&]<class Time>() {
+    // The validated price cap of 10,000,000 cents fits in 24 bits.
+    if (cats.names.size() <= 256)
+      process<Time, PackedPurchase>(data, out, start, end, begin, products, unknown);
+    else
+      process<Time, WidePurchase>(data, out, start, end, begin, products, unknown);
+  };
   if (span - 1 <= UINT32_MAX)
-    process<uint32_t>(data, out, start, end, begin);
+    run.operator()<uint32_t>();
   else
-    process<ll>(data, out, start, end, begin);
+    run.operator()<ll>();
 }
