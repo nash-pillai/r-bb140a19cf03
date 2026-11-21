@@ -306,8 +306,7 @@ struct Range {
   fs::path file;
   uint64_t begin, end;
 };
-vector<Range> line_ranges(const fs::path &dir) {
-  constexpr uint64_t block = 8 << 20;
+vector<Range> line_ranges(const fs::path &dir, uint64_t block = 8 << 20) {
   vector<Range> ranges;
   for (const auto &file : csv_files(dir)) {
     uint64_t bytes = fs::file_size(file);
@@ -366,10 +365,14 @@ class UserIndex {
     return true;
   }
 
-  static size_t probe(const vector<Slot> &table, uint64_t key) {
+  static size_t home(uint64_t key, size_t mask) {
     uint64_t mixed = (key ^ (key >> 33)) * 0xff51afd7ed558ccdULL;
+    return (mixed ^ (mixed >> 33)) & mask;
+  }
+
+  static size_t probe(const vector<Slot> &table, uint64_t key) {
     const size_t mask = table.size() - 1;
-    size_t index = (mixed ^ (mixed >> 33)) & mask;
+    size_t index = home(key, mask);
     while (table[index].id >= 0 && table[index].key != key)
       index = (index + 1) & mask;
     return index;
@@ -422,26 +425,164 @@ public:
     other.emplace(names.back(), index_id);
     return index_id;
   }
+
+  void build_links(const fs::path &dir, int threads) {
+    struct Batch {
+      vector<array<uint64_t, 2>> packed;
+      vector<pair<string, string>> other;
+    };
+    auto ranges = line_ranges(dir, 1 << 20);
+    vector<Batch> batches(ranges.size());
+    parallel_jobs(ranges.size(), threads, [&](int, size_t r) {
+      auto &batch = batches[r];
+      auto &range = ranges[r];
+      read_range<2>(range.file, range.begin, range.end, [&](auto &f) {
+        if (f[0].empty() || f[1].empty())
+          return;
+        array<uint64_t, 2> edge;
+        if (packed_key(f[0], edge[0]) && edge[0] &&
+            packed_key(f[1], edge[1]) && edge[1])
+          batch.packed.push_back(edge);
+        else
+          batch.other.emplace_back(f[0], f[1]);
+      });
+    });
+
+    size_t endpoints = 0;
+    bool has_other = false;
+    for (const auto &batch : batches) {
+      endpoints += 2 * batch.packed.size();
+      has_other |= !batch.other.empty();
+    }
+    size_t capacity = slots.size();
+    while (endpoints > capacity / 4 * 3)
+      capacity *= 2;
+    slots.resize(capacity);
+
+    // A nonzero suffix is its own publication token. No separate value is
+    // read until all inserters have joined. Zero suffixes follow the merge below.
+    parallel_jobs(batches.size(), threads, [&](int, size_t r) {
+      for (auto &edge : batches[r].packed) {
+        for (auto &key : edge) {
+          size_t pos = home(key, capacity - 1);
+          for (;; pos = (pos + 1) & (capacity - 1)) {
+            atomic_ref<uint64_t> cell(slots[pos].key);
+            uint64_t seen = cell.load(memory_order_relaxed);
+            if (!seen)
+              cell.compare_exchange_strong(seen, key, memory_order_relaxed);
+            if (!seen || seen == key)
+              break;
+          }
+          key = pos;
+        }
+      }
+    });
+
+    vector<int> parent(capacity, -1);
+    // Every successful hook points strictly toward a smaller byte string.
+    // Concurrent unions can move the target root again without creating a cycle.
+    auto concurrent_root = [&](int pos) {
+      for (;;) {
+        int next = atomic_ref<int>(parent[pos]).load(memory_order_relaxed);
+        if (next < 0)
+          return pos;
+        int grandparent = atomic_ref<int>(parent[next]).load(memory_order_relaxed);
+        if (grandparent >= 0) {
+          atomic_ref<int>(parent[pos]).store(grandparent, memory_order_relaxed);
+          pos = grandparent;
+        } else {
+          pos = next;
+        }
+      }
+    };
+    parallel_jobs(batches.size(), threads, [&](int, size_t r) {
+      for (const auto &edge : batches[r].packed) {
+        int a = edge[0], b = edge[1];
+        for (;;) {
+          a = concurrent_root(a);
+          b = concurrent_root(b);
+          if (a == b)
+            break;
+          if (memcmp(&slots[b].key, &slots[a].key, 8) < 0)
+            swap(a, b);
+          int expected = -1;
+          if (atomic_ref<int>(parent[b]).compare_exchange_strong(
+                  expected, a, memory_order_relaxed))
+            break;
+          b = expected;
+        }
+      }
+    });
+
+    // Partition the slot array, count component roots and prefix-sum their
+    // counts. This gives each job a disjoint slice of the canonical names.
+    constexpr size_t block_size = 32768;
+    const size_t blocks = (capacity + block_size - 1) / block_size;
+    struct alignas(64) Counts { size_t keys = 0, roots = 0, next = 0; };
+    vector<Counts> counts(blocks);
+    auto scan = [&](auto visit) {
+      parallel_jobs(blocks, threads, [&](int, size_t job) {
+        const size_t end = min(capacity, (job + 1) * block_size);
+        for (size_t i = job * block_size; i < end; ++i)
+          if (slots[i].key)
+            visit(job, i);
+      });
+    };
+    scan([&](size_t job, size_t i) {
+      ++counts[job].keys;
+      counts[job].roots += parent[i] == -1;
+    });
+    size_t roots = 0;
+    for (auto &block : counts) {
+      occupied += block.keys;
+      block.next = roots;
+      roots += block.roots;
+    }
+    names.resize(roots);
+    scan([&](size_t job, size_t i) {
+      if (parent[i] == -1) {
+        const int id = counts[job].next++;
+        char name[9] = {'u'};
+        memcpy(name + 1, &slots[i].key, 8);
+        names[id].assign(name, sizeof(name));
+        parent[i] = -2 - id;
+      }
+    });
+    scan([&](size_t, size_t i) {
+      int r = concurrent_root(i);
+      slots[i].id = -2 - atomic_ref<int>(parent[r]).load(memory_order_relaxed);
+    });
+
+    if (!has_other)
+      return;
+    // Mixed edges can join entire packed components. id() already returns
+    // their canonical vertex, and interns any new endpoint by its full bytes.
+    vector<int> merged;
+    auto representative = [&](int vertex) {
+      while (merged.size() < names.size())
+        merged.push_back(merged.size());
+      while (merged[vertex] != vertex) {
+        merged[vertex] = merged[merged[vertex]];
+        vertex = merged[vertex];
+      }
+      return vertex;
+    };
+    for (const auto &batch : batches) {
+      for (const auto &[left, right] : batch.other) {
+        int a = representative(id(left)), b = representative(id(right));
+        if (a != b) {
+          if (names[b] < names[a])
+            swap(a, b);
+          merged[b] = a;
+        }
+      }
+    }
+    for (size_t i = 0; i < merged.size(); ++i)
+      merged[i] = representative(i);
+    apply_roots(merged);
+  }
 } users;
 
-vector<int> parent;
-int root(int x) {
-  int r = x;
-  while (parent[r] != r)
-    r = parent[r];
-  while (parent[x] != x) {
-    int q = parent[x];
-    parent[x] = r;
-    x = q;
-  }
-  return r;
-}
-int uid(string_view s) {
-  int x = users.id(s);
-  while (parent.size() < users.names.size())
-    parent.push_back(parent.size());
-  return x;
-}
 template <class Time> struct EventRecord {
   Time ts = 0;
   int user = -1, cat = 0, price = 0;
@@ -685,16 +826,8 @@ void process(const string &data, const string &out, ll start, ll end,
         << chrono::duration<double>(chrono::steady_clock::now() - begin).count()
         << "\n";
   };
-  rows<2>(data + "/links", [&](auto &f) {
-    if (f[0].empty() || f[1].empty())
-      return;
-    int a = root(uid(f[0])), b = root(uid(f[1]));
-    if (a != b) {
-      if (users.names[b] < users.names[a])
-        swap(a, b);
-      parent[b] = a;
-    }
-  });
+  const int threads = clamp(getenv("NCPU") ? atoi(getenv("NCPU")) : 8, 1, 8);
+  users.build_links(data + "/links", threads);
   StrMap<int> products;
   int unknown = cats.id("unknown");
   rows<2>(data + "/products.csv",
@@ -709,7 +842,6 @@ void process(const string &data, const string &out, ll start, ll end,
     channels[c] = f[1];
   });
   checkpoint("links and dimensions");
-  const int threads = clamp(getenv("NCPU") ? atoi(getenv("NCPU")) : 8, 1, 8);
   constexpr size_t partitions = 256;
   struct Reader {
     array<vector<Kept>, partitions> records;
@@ -718,12 +850,6 @@ void process(const string &data, const string &out, ll start, ll end,
   };
   auto ranges = line_ranges(data + "/events");
   vector<Reader> readers(threads);
-  // Publish the canonical IDs in the lookup table once links are complete.
-  // Any later insertion is an unlinked singleton with its own name index.
-  for (size_t i = 0; i < parent.size(); ++i)
-    parent[i] = root(i);
-  users.apply_roots(parent);
-  vector<int>().swap(parent);
   EventKeys keys;
   parallel_jobs(ranges.size(), threads, [&](int worker, size_t job) {
     auto &reader = readers[worker];
