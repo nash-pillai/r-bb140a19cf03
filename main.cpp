@@ -4,6 +4,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "daily_writer.h"
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 using namespace std;
 namespace fs = std::filesystem;
 using ll = long long;
@@ -137,8 +141,90 @@ void read_stream_range(const fs::path &file, uint64_t begin, uint64_t end, int f
   if (in.bad())
     throw runtime_error("read failed: " + file.string());
 }
-template <class F>
-void read_range(const fs::path &file, uint64_t begin, uint64_t end, int fields,
+#if defined(__x86_64__)
+// Decode all complete rows in a block. The next block starts at the first
+// unconsumed row, so delimiter offsets fit in sixteen bits.
+constexpr int csv_block = 2048;
+__attribute__((target("avx2,popcnt,pclmul")))
+static bool index_block(const char *data, uint16_t *cuts, uint16_t *rows,
+                        int &row_count) {
+  int fields = 0;
+  uint32_t preceding_cut = 1, pending_quote = 0, parity_carry = 0, bad = 0;
+  for (int base = 0; base < csv_block; base += 32) {
+    const auto bytes = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(data + base));
+    const auto lf = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8('\n'));
+    const auto comma = _mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(','));
+    uint32_t ends = _mm256_movemask_epi8(_mm256_or_si256(lf, comma));
+    uint32_t lines = _mm256_movemask_epi8(lf);
+    uint32_t marks = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8('"')));
+    // Each quote must touch a delimiter. A quote in the final lane can
+    // also be adjacent to the delimiter in lane zero of the next vector.
+    uint32_t interior = marks & ~((ends << 1) | preceding_cut | (ends >> 1));
+    bad |= (interior & 0x7fffffffU) | (pending_quote & ~ends);
+    pending_quote = interior >> 31;
+    preceding_cut = ends >> 31;
+
+    // Carryless multiplication by all ones computes the inclusive prefix XOR
+    // of quote bits. Every comma and LF must end a field with even parity.
+    const auto prefix = _mm_clmulepi64_si128(_mm_cvtsi32_si128(marks), _mm_set1_epi32(-1), 0);
+    uint32_t parity = uint32_t(_mm_cvtsi128_si32(prefix)) ^ parity_carry;
+    bad |= parity & ends;
+    parity_carry = 0u - (parity >> 31);
+    while (lines) {
+      uint32_t through_lf = lines ^ (lines - 1);
+      rows[row_count++] = fields + popcount(ends & through_lf);
+      lines &= lines - 1;
+    }
+    while (ends) {
+      cuts[++fields] = uint16_t(base + countr_zero(ends));
+      ends &= ends - 1;
+    }
+  }
+  // Any trailing partial row is indexed again starting at its own boundary.
+  return bad == 0;
+}
+
+template <int Fields, class F>
+const char *read_blocks(const char *line, const char *limit, F &fun) {
+  array<uint16_t, csv_block + 1> cuts;
+  array<uint16_t, csv_block> rows;
+  array<string_view, Fields> values;
+  vector<string_view> scalar;
+  while (limit - line >= csv_block) {
+    // The synthetic cut immediately before the block is its preceding LF.
+    cuts[0] = UINT16_MAX;
+    int row_count = 0;
+    bool clean = index_block(line, cuts.data(), rows.data(), row_count);
+    if (row_count == 0)
+      break;
+    int first = 0;
+    for (int i = 0; i < row_count; ++i) {
+      const int last = rows[i];
+      if (last - first == Fields) {
+        if (clean) {
+          for (int f = 0; f < Fields; ++f) {
+            const char *start = line + uint16_t(cuts[first + f] + 1);
+            const char *end = line + cuts[first + f + 1];
+            int trim = *start == '"';
+            values[f] = {start + trim, size_t(end - start - 2 * trim)};
+          }
+          fun(values);
+        } else {
+          const char *start = line + uint16_t(cuts[first] + 1);
+          if (csv({start, size_t(line + cuts[last] - start)}, scalar, Fields))
+            fun(scalar);
+        }
+      }
+      first = last;
+    }
+    line += cuts[first] + 1;
+  }
+  return line;
+}
+#endif
+
+template <int Fields, class F>
+void read_range(const fs::path &file, uint64_t begin, uint64_t end,
                 F fun) {
   const int fd = open(file.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd == -1)
@@ -157,7 +243,7 @@ void read_range(const fs::path &file, uint64_t begin, uint64_t end, int fields,
   void *mapped = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
   close(fd);
   if (mapped == MAP_FAILED) {
-    read_stream_range(file, begin, end, fields, move(fun));
+    read_stream_range(file, begin, end, Fields, move(fun));
     return;
   }
   auto release = [size](void *address) { munmap(address, size); };
@@ -172,18 +258,26 @@ void read_range(const fs::path &file, uint64_t begin, uint64_t end, int fields,
   if (!previous)
     return;
   vector<string_view> values;
-  values.reserve(fields);
+  values.reserve(Fields);
   for (auto *line = previous + 1; line < range_end;) {
+#if defined(__x86_64__)
+    if (range_end - line >= csv_block && __builtin_cpu_supports("avx2") &&
+        __builtin_cpu_supports("popcnt") && __builtin_cpu_supports("pclmul")) {
+      line = read_blocks<Fields>(line, range_end, fun);
+      if (line == range_end)
+        break;
+    }
+#endif
     const auto *next = newline(line);
     const auto *line_end = next ? next : file_end;
-    if (csv(string_view(line, line_end - line), values, fields))
+    if (csv(string_view(line, line_end - line), values, Fields))
       fun(values);
     line = next ? next + 1 : file_end;
   }
 }
-template <class F> void rows(const fs::path &p, int fields, F fun) {
+template <int Fields, class F> void rows(const fs::path &p, F fun) {
   for (const auto &file : csv_files(p))
-    read_range(file, 0, fs::file_size(file), fields, fun);
+    read_range<Fields>(file, 0, fs::file_size(file), fun);
 }
 
 template <class F> void parallel_jobs(size_t jobs, int threads, F fun) {
@@ -480,7 +574,26 @@ public:
   }
 };
 
-string quote(const string &s) { return "\"" + s + "\""; }
+fs::path part_name(const fs::path &folder, int worker) {
+  return folder / (worker ? "part-" + to_string(worker) + ".parquet" : "part.parquet");
+}
+
+void finish_parts(const fs::path &folder, int count) {
+  set<fs::path> current;
+  for (int i = 0; i < count; ++i) {
+    auto path = part_name(folder, i);
+    fs::rename(path.string() + ".tmp", path);
+    current.insert(path);
+  }
+  // A retry may use fewer workers or an output folder from a prior run.
+  for (const auto &e : fs::directory_iterator(folder)) {
+    auto name = e.path().filename().string();
+    bool abandoned = name.starts_with("part-") && name.ends_with(".parquet.tmp");
+    if (e.is_regular_file() && (abandoned ||
+        (e.path().extension() == ".parquet" && !current.contains(e.path()))))
+      fs::remove(e.path());
+  }
+}
 template <class Time>
 void process(const string &data, const string &out, ll start, ll end,
              chrono::steady_clock::time_point begin) {
@@ -494,7 +607,7 @@ void process(const string &data, const string &out, ll start, ll end,
         << chrono::duration<double>(chrono::steady_clock::now() - begin).count()
         << "\n";
   };
-  rows(data + "/links", 2, [&](auto &f) {
+  rows<2>(data + "/links", [&](auto &f) {
     if (f[0].empty() || f[1].empty())
       return;
     int a = root(uid(f[0])), b = root(uid(f[1]));
@@ -506,12 +619,12 @@ void process(const string &data, const string &out, ll start, ll end,
   });
   StrMap<int> products;
   int unknown = cats.id("unknown");
-  rows(data + "/products.csv", 2,
+  rows<2>(data + "/products.csv",
        [&](auto &f) { products[string(f[0])] = cats.id(f[1]); });
   vector<string> channels;
   int organic = camps.id("organic");
   channels.push_back("organic");
-  rows(data + "/campaigns.csv", 2, [&](auto &f) {
+  rows<2>(data + "/campaigns.csv", [&](auto &f) {
     int c = camps.id(f[0]);
     if (channels.size() <= size_t(c))
       channels.resize(c + 1);
@@ -537,7 +650,7 @@ void process(const string &data, const string &out, ll start, ll end,
   parallel_jobs(ranges.size(), threads, [&](int worker, size_t job) {
     auto &reader = readers[worker];
     const auto &range = ranges[job];
-    read_range(range.file, range.begin, range.end, 7, [&](auto &f) {
+    read_range<7>(range.file, range.begin, range.end, [&](auto &f) {
       if (f[0].empty())
         return;
       ll ingest = timestamp(f[3]);
@@ -638,7 +751,7 @@ void process(const string &data, const string &out, ll start, ll end,
   ranges = line_ranges(data + "/clicks");
   parallel_jobs(ranges.size(), threads, [&](int worker, size_t job) {
     const auto &range = ranges[job];
-    read_range(range.file, range.begin, range.end, 4, [&](auto &f) {
+    read_range<4>(range.file, range.begin, range.end, [&](auto &f) {
       if (f[0].empty() || f[1].empty())
         return;
       ll ts = timestamp(f[3]);
@@ -661,11 +774,10 @@ void process(const string &data, const string &out, ll start, ll end,
     totals.emplace_back(camps.names.size(), utc_day(start), utc_day(end - 1));
   fs::create_directories(out + "/user_daily");
   fs::create_directories(out + "/campaign_daily");
-  ofstream u(out + "/user_daily/raw.csv"), c(out + "/campaign_daily/raw.csv");
-  u << "user_id,day,sessions,events,revenue_cents,top_category\n";
-  c << "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,"
-       "assisted_sessions\n";
-  mutex output_lock;
+  vector<unique_ptr<DailyWriter>> user_files;
+  for (int i = 0; i < threads; ++i)
+    user_files.push_back(make_unique<DailyWriter>(
+        part_name(out + "/user_daily", i).string() + ".tmp", true));
   atomic<size_t> valid_events{0};
   parallel_jobs(person_groups, threads, [&](int worker, size_t group) {
     auto events = gather(surviving, group);
@@ -692,7 +804,7 @@ void process(const string &data, const string &out, ll start, ll end,
       return click_ids.compare(a.id, b.id) == 0;
     }), clicks.end());
     auto &ca = totals[worker];
-    ostringstream user_rows;
+    auto &user_file = *user_files[worker];
     size_t ei = 0, ci = 0;
     while (ei < events.size()) {
       int user = events[ei].user;
@@ -747,15 +859,13 @@ void process(const string &data, const string &out, ll start, ll end,
             top = cat;
             revenue = r;
           }
-        user_rows << quote(users.names[user]) << ',' << day << ',' << a.sessions << ','
-          << a.events << ',' << a.revenue << ','
-          << (top < 0 ? "" : quote(cats.names[top])) << '\n';
+        user_file.append(users.names[user], day, a.sessions, a.events, a.revenue,
+                         top < 0 ? nullptr : &cats.names[top]);
       }
       ci = ce;
     }
-    lock_guard lock(output_lock);
-    u << user_rows.view();
   });
+  parallel_jobs(threads, threads, [&](int, size_t i) { user_files[i]->close(); });
   cerr << "valid events " << valid_events.load() << "\n";
   map<pair<int, ll>, CampaignAgg> ca;
   for (const auto &local : totals) {
@@ -767,16 +877,15 @@ void process(const string &data, const string &out, ll start, ll end,
       total.assist += a.assist;
     });
   }
+  DailyWriter campaign_file(part_name(out + "/campaign_daily", 0).string() + ".tmp", false);
   for (auto &[key, a] : ca) {
     auto [camp, day] = key;
-    c << quote(camps.names[camp]) << ',' << quote(channels[camp]) << ',' << day
-      << ',' << a.sessions << ',' << a.purchasing << ',' << a.revenue << ','
-      << a.assist << '\n';
+    campaign_file.append(camps.names[camp], day, a.sessions, a.purchasing,
+                         a.revenue, &channels[camp], a.assist);
   }
-  u.close();
-  c.close();
-  if (!u || !c)
-    throw runtime_error("cannot write daily outputs");
+  campaign_file.close();
+  finish_parts(out + "/user_daily", threads);
+  finish_parts(out + "/campaign_daily", 1);
   cerr << "core seconds "
        << chrono::duration<double>(chrono::steady_clock::now() - begin).count()
        << "\n";
