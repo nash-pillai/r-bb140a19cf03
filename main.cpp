@@ -1,5 +1,9 @@
 #include <bits/stdc++.h>
+#include <fcntl.h>
 #include <filesystem>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 using namespace std;
 namespace fs = std::filesystem;
 using ll = long long;
@@ -33,7 +37,7 @@ ll days(int y, unsigned m, unsigned d) {
   int era = (y >= 0 ? y : y - 399) / 400;
   unsigned yo = y - era * 400;
   unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-  return era * 146097 + (yo * 365 + yo / 4 - yo / 100 + doy) - 719468;
+  return ll(era) * 146097 + (yo * 365 + yo / 4 - yo / 100 + doy) - 719468;
 }
 constexpr ll bad_time = LLONG_MIN;
 ll timestamp(string_view s) {
@@ -110,7 +114,7 @@ vector<fs::path> csv_files(const fs::path &p) {
 // Read a disjoint range of line starts. A preceding newline belongs to the
 // previous range; an unterminated last line is still a record.
 template <class F>
-void read_range(const fs::path &file, uint64_t begin, uint64_t end, int fields,
+void read_stream_range(const fs::path &file, uint64_t begin, uint64_t end, int fields,
                 F fun) {
   vector<char> buffer(256 * 1024);
   ifstream in;
@@ -132,6 +136,50 @@ void read_range(const fs::path &file, uint64_t begin, uint64_t end, int fields,
   }
   if (in.bad())
     throw runtime_error("read failed: " + file.string());
+}
+template <class F>
+void read_range(const fs::path &file, uint64_t begin, uint64_t end, int fields,
+                F fun) {
+  const int fd = open(file.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd == -1)
+    throw system_error(errno, generic_category(), file.string());
+  struct stat info;
+  if (fstat(fd, &info) == -1) {
+    const int error = errno;
+    close(fd);
+    throw system_error(error, generic_category(), file.string());
+  }
+  const size_t size = info.st_size;
+  if (begin >= size) {
+    close(fd);
+    return;
+  }
+  void *mapped = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd);
+  if (mapped == MAP_FAILED) {
+    read_stream_range(file, begin, end, fields, move(fun));
+    return;
+  }
+  auto release = [size](void *address) { munmap(address, size); };
+  const unique_ptr<void, decltype(release)> mapping(mapped, release);
+  const auto *data = static_cast<const char *>(mapping.get());
+  const auto *file_end = data + size;
+  const auto *range_end = data + min<uint64_t>(end, size);
+  auto newline = [file_end](const char *line) {
+    return static_cast<const char *>(memchr(line, '\n', file_end - line));
+  };
+  const auto *previous = newline(data + (begin ? begin - 1 : 0));
+  if (!previous)
+    return;
+  vector<string_view> values;
+  values.reserve(fields);
+  for (auto *line = previous + 1; line < range_end;) {
+    const auto *next = newline(line);
+    const auto *line_end = next ? next : file_end;
+    if (csv(string_view(line, line_end - line), values, fields))
+      fun(values);
+    line = next ? next + 1 : file_end;
+  }
 }
 template <class F> void rows(const fs::path &p, int fields, F fun) {
   for (const auto &file : csv_files(p))
@@ -197,7 +245,76 @@ struct Strings {
     ids.emplace(names.back(), n);
     return n;
   }
-} users, cats, camps;
+} cats, camps;
+
+class UserIndex {
+  struct Slot {
+    uint64_t key = 0;
+    int id = -1;
+  };
+  vector<Slot> slots = vector<Slot>(16);
+  size_t occupied = 0;
+  StrMap<int> other;
+
+  // All nine-byte IDs beginning with 'u' have an exact fixed-width encoding.
+  // Every other ID keeps its complete string and goes through the fallback.
+  static bool packed_key(string_view name, uint64_t &key) {
+    if (name.size() != 9 || name.front() != 'u')
+      return false;
+    memcpy(&key, name.data() + 1, sizeof(key));
+    return true;
+  }
+
+  static size_t probe(const vector<Slot> &table, uint64_t key) {
+    uint64_t mixed = (key ^ (key >> 33)) * 0xff51afd7ed558ccdULL;
+    const size_t mask = table.size() - 1;
+    size_t index = (mixed ^ (mixed >> 33)) & mask;
+    while (table[index].id >= 0 && table[index].key != key)
+      index = (index + 1) & mask;
+    return index;
+  }
+
+public:
+  vector<string> names;
+
+  int find(string_view name) const {
+    uint64_t key;
+    if (packed_key(name, key))
+      return slots[probe(slots, key)].id;
+    const auto item = other.find(name);
+    return item == other.end() ? -1 : item->second;
+  }
+
+  int id(string_view name) {
+    uint64_t key;
+    if (packed_key(name, key)) {
+      auto index = probe(slots, key);
+      if (slots[index].id >= 0)
+        return slots[index].id;
+      if ((occupied + 1) * 4 > slots.size() * 3) {
+        vector<Slot> larger(slots.size() * 2);
+        for (const auto &slot : slots)
+          if (slot.id >= 0)
+            larger[probe(larger, slot.key)] = slot;
+        slots.swap(larger);
+        index = probe(slots, key);
+      }
+      const int index_id = names.size();
+      names.emplace_back(name);
+      slots[index] = {key, index_id};
+      ++occupied;
+      return index_id;
+    }
+    const auto item = other.find(name);
+    if (item != other.end())
+      return item->second;
+    const int index_id = names.size();
+    names.emplace_back(name);
+    other.emplace(names.back(), index_id);
+    return index_id;
+  }
+} users;
+
 vector<int> parent;
 int root(int x) {
   int r = x;
@@ -216,8 +333,8 @@ int uid(string_view s) {
     parent.push_back(parent.size());
   return x;
 }
-struct Event {
-  ll ts = 0;
+template <class Time> struct EventRecord {
+  Time ts = 0;
   int user = -1, cat = 0, price = 0;
 };
 // Common event IDs have prefix e and up to eight suffix bytes. Store the
@@ -243,48 +360,82 @@ public:
     return other.emplace(string(s), tag | other.size()).first->second;
   }
 };
-struct Kept {
+template <class Time> struct KeptRecord {
   uint64_t key;
   ll ingest;
-  Event e;
+  EventRecord<Time> e;
 };
+
+class ClickIds {
+  static constexpr uint64_t fallback = uint64_t{1} << 63;
+  vector<vector<string>> other_ids;
+
+  static uint64_t byte_order(uint64_t value) {
+    if constexpr (endian::native == endian::little)
+      return __builtin_bswap64(value);
+    return value;
+  }
+
+  string_view bytes(uint64_t key, array<char, 9> &buffer) const {
+    if (key & fallback) {
+      uint64_t index = key & ~fallback;
+      return other_ids[index % other_ids.size()][index / other_ids.size()];
+    }
+    buffer[0] = 'k';
+    uint64_t suffix = byte_order(key);
+    memcpy(buffer.data() + 1, &suffix, sizeof(suffix));
+    return {buffer.data(), buffer.size()};
+  }
+
+public:
+  explicit ClickIds(int readers) : other_ids(readers) {}
+
+  uint64_t encode(string_view id, int reader) {
+    if (id.size() == 9 && id.front() == 'k') {
+      uint64_t suffix;
+      memcpy(&suffix, id.data() + 1, sizeof(suffix));
+      const auto key = byte_order(suffix);
+      if (!(key & fallback))
+        return key;
+    }
+    // Each worker owns one fallback vector until the reader threads join.
+    auto &ids = other_ids[reader];
+    uint64_t index = ids.size() * other_ids.size() + reader;
+    ids.emplace_back(id);
+    return fallback | index;
+  }
+
+  strong_ordering compare(uint64_t a, uint64_t b) const {
+    if (a == b || !((a | b) & fallback))
+      return a <=> b;
+    array<char, 9> a_buffer, b_buffer;
+    return bytes(a, a_buffer) <=> bytes(b, b_buffer);
+  }
+};
+
 struct Click {
   ll ts;
+  uint64_t id;
   int user, camp;
-  string id;
 };
 struct Agg {
   ll sessions = 0, events = 0, revenue = 0, purchasing = 0, assist = 0;
   map<int, ll> cat;
 };
 string quote(const string &s) { return "\"" + s + "\""; }
-int main(int argc, char **argv) {
-  auto begin = chrono::steady_clock::now();
+template <class Time>
+void process(const string &data, const string &out, ll start, ll end,
+             chrono::steady_clock::time_point begin) {
+  using Event = EventRecord<Time>;
+  using Kept = KeptRecord<Time>;
+  // Valid events have already passed the half-open window check on absolute time.
+  const ll origin = is_same_v<Time, uint32_t> ? start : 0;
   auto checkpoint = [&](const char *label) {
     cerr
         << label << " seconds "
         << chrono::duration<double>(chrono::steady_clock::now() - begin).count()
         << "\n";
   };
-  string data = getenv("DATA_DIR") ? getenv("DATA_DIR")
-                                   : (argc > 1 ? argv[1] : "/data"),
-         out = getenv("OUTPUT_DIR") ? getenv("OUTPUT_DIR")
-                                    : (argc > 2 ? argv[2] : "/output");
-  string manifest;
-  {
-    ifstream f(data + "/manifest.json");
-    manifest.assign(istreambuf_iterator<char>(f), {});
-  }
-  auto val = [&](string k) {
-    auto p = manifest.find('"' + k + '"');
-    p = manifest.find(':', p);
-    p = manifest.find('"', p);
-    auto q = manifest.find('"', p + 1);
-    return manifest.substr(p + 1, q - p - 1);
-  };
-  ll start = timestamp(val("window_start")), end = timestamp(val("window_end"));
-  if (start == bad_time || end == bad_time || start >= end)
-    throw runtime_error("missing or invalid manifest window");
   rows(data + "/links", 2, [&](auto &f) {
     if (f[0].empty() || f[1].empty())
       return;
@@ -313,7 +464,7 @@ int main(int argc, char **argv) {
   constexpr size_t partitions = 256;
   struct Reader {
     array<vector<Kept>, partitions> records;
-    Strings unlinked;
+    UserIndex unlinked;
     vector<int> resolved;
   };
   auto ranges = line_ranges(data + "/events");
@@ -336,11 +487,10 @@ int main(int argc, char **argv) {
       if (!f[1].empty() && ts >= start && ts < end &&
           (purchase || f[4] == "view" || f[4] == "cart") &&
           !f[5].empty() && (!purchase || price >= 1) &&
-          ingest - ts <= DAY) {
-        auto known = as_const(users.ids).find(f[1]);
-        e.user = known == users.ids.end() ? -2 - reader.unlinked.id(f[1])
-                                          : canonical[known->second];
-        e.ts = ts;
+          (ingest <= ts || uint64_t(ingest) - uint64_t(ts) <= uint64_t(DAY))) {
+        const int known = users.find(f[1]);
+        e.user = known < 0 ? -2 - reader.unlinked.id(f[1]) : canonical[known];
+        e.ts = static_cast<Time>(ts - origin);
         e.price = price;
         if (purchase) {
           auto product = as_const(products).find(f[5]);
@@ -365,31 +515,41 @@ int main(int argc, char **argv) {
     size_t count = 0;
     for (auto &reader : readers)
       count += reader.records[part].size();
-    vector<Kept> records;
-    records.reserve(count);
+    if (count == 0)
+      return;
+    // Each slot points into an immutable-size reader batch. On a duplicate
+    // invalidate the loser, even when the winning copy is itself invalid.
+    const size_t capacity = bit_ceil(count + count / 3 + 1);
+    vector<Kept *> slots(capacity);
+    for (auto &reader : readers) {
+      for (auto &record : reader.records[part]) {
+        uint64_t h = (record.key ^ (record.key >> 33)) * 0xff51afd7ed558ccdULL;
+        size_t i = (h ^ (h >> 33)) & (capacity - 1);
+        while (slots[i] && slots[i]->key != record.key)
+          i = (i + 1) & (capacity - 1);
+        Kept *&winner = slots[i];
+        if (!winner) {
+          winner = &record;
+        } else if (record.ingest < winner->ingest) {
+          winner->e.user = -1;
+          winner = &record;
+        } else {
+          record.e.user = -1;
+        }
+      }
+    }
+    auto &groups = surviving[worker];
     for (auto &reader : readers) {
       auto &batch = reader.records[part];
       for (auto &record : batch) {
-        int &u = record.e.user;
-        if (u < -1)
-          u = reader.resolved[-2 - u];
-        records.push_back(record);
+        auto &e = record.e;
+        if (e.user == -1)
+          continue;
+        if (e.user < -1)
+          e.user = reader.resolved[-2 - e.user];
+        groups[e.user % person_groups].push_back(e);
       }
       vector<Kept>().swap(batch);
-    }
-    sort(records.begin(), records.end(),
-         [](auto &a, auto &b) { return a.key < b.key; });
-    auto &groups = surviving[worker];
-    for (size_t i = 0; i < count;) {
-      size_t winner = i++;
-      while (i < count && records[i].key == records[winner].key) {
-        if (records[i].ingest < records[winner].ingest)
-          winner = i;
-        ++i;
-      }
-      const auto &event = records[winner].e;
-      if (event.user >= 0)
-        groups[event.user % person_groups].push_back(event);
     }
   });
   checkpoint("event dedup");
@@ -397,6 +557,7 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < parent.size(); ++i)
     canonical[i] = root(i);
   vector<Groups<Click>> click_batches(threads);
+  ClickIds click_ids(threads);
   ranges = line_ranges(data + "/clicks");
   parallel_jobs(ranges.size(), threads, [&](int worker, size_t job) {
     const auto &range = ranges[job];
@@ -409,12 +570,12 @@ int main(int argc, char **argv) {
           c->second == organic)
         return;
       // A previously unseen, unlinked user has no events to credit or assist.
-      auto person = as_const(users.ids).find(f[1]);
-      if (person == users.ids.end())
+      const int person = users.find(f[1]);
+      if (person < 0)
         return;
-      int user = canonical[person->second];
+      int user = canonical[person];
       click_batches[worker][user % person_groups].push_back(
-          {ts, user, c->second, string(f[0])});
+          {ts, click_ids.encode(f[0], worker), user, c->second});
     });
   });
   checkpoint("click parse");
@@ -432,17 +593,24 @@ int main(int argc, char **argv) {
     auto clicks = gather(click_batches, group);
     valid_events.fetch_add(events.size(), memory_order_relaxed);
     sort(events.begin(), events.end(),
-         [](auto &a, auto &b) { return tie(a.user, a.ts) < tie(b.user, b.ts); });
-    sort(clicks.begin(), clicks.end(), [](auto &a, auto &b) {
+         [](const Event &a, const Event &b) {
+           if constexpr (is_same_v<Time, uint32_t>) {
+             auto key = [](const Event &e) { return (uint64_t(e.user) << 32) | e.ts; };
+             return key(a) < key(b);
+           } else {
+             return tie(a.user, a.ts) < tie(b.user, b.ts);
+           }
+         });
+    sort(clicks.begin(), clicks.end(), [&](auto &a, auto &b) {
       if (a.user != b.user)
         return a.user < b.user;
       if (a.ts != b.ts)
         return a.ts < b.ts;
-      return a.id > b.id;
+      return click_ids.compare(a.id, b.id) > 0;
     });
     // Identical copies are adjacent. Descending ID leaves the smallest tie last.
-    clicks.erase(unique(clicks.begin(), clicks.end(), [](auto &a, auto &b) {
-      return a.id == b.id;
+    clicks.erase(unique(clicks.begin(), clicks.end(), [&](auto &a, auto &b) {
+      return click_ids.compare(a.id, b.id) == 0;
     }), clicks.end());
     auto &ca = totals[worker];
     ostringstream user_rows;
@@ -461,7 +629,7 @@ int main(int argc, char **argv) {
       unordered_map<int, int> active;
       map<ll, Agg> ua;
       while (ei < ee) {
-        ll sessionStart = events[ei].ts, day = sessionStart / DAY - (sessionStart % DAY < 0);
+        ll sessionStart = origin + ll(events[ei].ts), day = sessionStart / DAY - (sessionStart % DAY < 0);
         while (right < ce && clicks[right].ts <= sessionStart)
           active[clicks[right++].camp]++;
         while (left < right && clicks[left].ts < sessionStart - WEEK) {
@@ -475,7 +643,7 @@ int main(int argc, char **argv) {
         us.sessions++;
         cs.sessions++;
         bool purchase = false;
-        ll prev = events[ei].ts;
+        Time prev;
         do {
           auto &e = events[ei++];
           us.events++;
@@ -486,7 +654,7 @@ int main(int argc, char **argv) {
             us.cat[e.cat] += e.price;
           }
           prev = e.ts;
-        } while (ei < ee && events[ei].ts - prev <= 1800000);
+        } while (ei < ee && uint64_t(events[ei].ts) - uint64_t(prev) <= 1800000);
         cs.purchasing += purchase;
         for (auto &[camp, n] : active)
           ca[{camp, day}].assist++;
@@ -533,4 +701,33 @@ int main(int argc, char **argv) {
   cerr << "core seconds "
        << chrono::duration<double>(chrono::steady_clock::now() - begin).count()
        << "\n";
+}
+
+int main(int argc, char **argv) {
+  auto begin = chrono::steady_clock::now();
+  string data = getenv("DATA_DIR") ? getenv("DATA_DIR")
+                                   : (argc > 1 ? argv[1] : "/data"),
+         out = getenv("OUTPUT_DIR") ? getenv("OUTPUT_DIR")
+                                    : (argc > 2 ? argv[2] : "/output");
+  string manifest;
+  {
+    ifstream f(data + "/manifest.json");
+    manifest.assign(istreambuf_iterator<char>(f), {});
+  }
+  auto val = [&](string k) {
+    auto p = manifest.find('"' + k + '"');
+    p = manifest.find(':', p);
+    p = manifest.find('"', p);
+    auto q = manifest.find('"', p + 1);
+    return manifest.substr(p + 1, q - p - 1);
+  };
+  ll start = timestamp(val("window_start")), end = timestamp(val("window_end"));
+  if (start == bad_time || end == bad_time || start >= end)
+    throw runtime_error("missing or invalid manifest window");
+  // Unsigned subtraction also covers a window spanning the epoch.
+  const uint64_t span = uint64_t(end) - uint64_t(start);
+  if (span - 1 <= UINT32_MAX)
+    process<uint32_t>(data, out, start, end, begin);
+  else
+    process<ll>(data, out, start, end, begin);
 }
