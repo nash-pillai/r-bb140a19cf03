@@ -370,15 +370,23 @@ class UserIndex {
     return (mixed ^ (mixed >> 33)) & mask;
   }
 
-  static size_t probe(const vector<Slot> &table, uint64_t key) {
+  static size_t probe(const vector<Slot> &table, uint64_t key, size_t index) {
     const size_t mask = table.size() - 1;
-    size_t index = home(key, mask);
     while (table[index].id >= 0 && table[index].key != key)
       index = (index + 1) & mask;
     return index;
   }
 
+  static size_t probe(const vector<Slot> &table, uint64_t key) {
+    return probe(table, key, home(key, table.size() - 1));
+  }
+
 public:
+  struct Lookup {
+    uint64_t key = 0;
+    size_t first = SIZE_MAX;
+  };
+
   vector<string> names;
 
   void apply_roots(const vector<int> &roots) {
@@ -389,12 +397,27 @@ public:
       entry.second = roots[entry.second];
   }
 
-  int find(string_view name) const {
-    uint64_t key;
-    if (packed_key(name, key))
-      return slots[probe(slots, key)].id;
+  Lookup prepare_lookup(string_view name) const {
+    Lookup lookup;
+    if (packed_key(name, lookup.key)) {
+      lookup.first = home(lookup.key, slots.size() - 1);
+      __builtin_prefetch(&slots[lookup.first], 0, 2);
+    }
+    return lookup;
+  }
+
+  int find(string_view name, Lookup lookup) const {
+    if (lookup.first != SIZE_MAX)
+      return slots[probe(slots, lookup.key, lookup.first)].id;
     const auto item = other.find(name);
     return item == other.end() ? -1 : item->second;
+  }
+
+  int find(string_view name) const {
+    Lookup lookup;
+    if (packed_key(name, lookup.key))
+      lookup.first = home(lookup.key, slots.size() - 1);
+    return find(name, lookup);
   }
 
   int id(string_view name) {
@@ -880,6 +903,7 @@ void process(const string &data, const string &out, ll start, ll end,
     read_range<7>(range.file, range.begin, range.end, [&](auto &f) {
       if (f[0].empty())
         return;
+      const auto user_lookup = users.prepare_lookup(f[1]);
       ll ingest = timestamp(f[3]);
       ll ts = timestamp(f[2]);
       bool purchase = f[4] == "purchase";
@@ -889,7 +913,7 @@ void process(const string &data, const string &out, ll start, ll end,
           (purchase || f[4] == "view" || f[4] == "cart") &&
           !f[5].empty() && (!purchase || price >= 1) &&
           (ingest <= ts || uint64_t(ingest) - uint64_t(ts) <= uint64_t(DAY))) {
-        const int known = users.find(f[1]);
+        const int known = users.find(f[1], user_lookup);
         e.user = known < 0 ? -2 - reader.unlinked.id(f[1]) : known;
         e.ts = static_cast<Time>(ts - origin);
         if (purchase) {
@@ -999,13 +1023,14 @@ void process(const string &data, const string &out, ll start, ll end,
     read_range<4>(range.file, range.begin, range.end, [&](auto &f) {
       if (f[0].empty() || f[1].empty())
         return;
+      const auto user_lookup = users.prepare_lookup(f[1]);
       ll ts = timestamp(f[3]);
       auto c = as_const(camps.ids).find(f[2]);
       if (ts < start - WEEK || ts >= end || c == camps.ids.end() ||
           c->second == organic)
         return;
       // A previously unseen, unlinked user has no events to credit or assist.
-      const int person = users.find(f[1]);
+      const int person = users.find(f[1], user_lookup);
       if (person < 0)
         return;
       click_batches[worker][person % person_groups].push_back(
