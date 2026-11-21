@@ -19,14 +19,6 @@ struct Hash {
 };
 template <class V> using StrMap = unordered_map<string, V, Hash, equal_to<>>;
 const ll DAY = 86400000, WEEK = 7 * DAY;
-bool digits(string_view s) {
-  if (s.empty())
-    return false;
-  for (unsigned char c : s)
-    if (c < '0' || c > '9')
-      return false;
-  return true;
-}
 ll number(string_view s, ll cap = LLONG_MAX) {
   ll n = 0;
   for (char c : s) {
@@ -36,51 +28,66 @@ ll number(string_view s, ll cap = LLONG_MAX) {
   }
   return s.empty() ? -1 : n;
 }
-ll days(int y, unsigned m, unsigned d) {
+constexpr ll days(int y, unsigned m, unsigned d) {
   y -= m <= 2;
   int era = (y >= 0 ? y : y - 399) / 400;
   unsigned yo = y - era * 400;
   unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
   return ll(era) * 146097 + (yo * 365 + yo / 4 - yo / 100 + doy) - 719468;
 }
+constexpr auto month_starts = [] {
+  array<int, 10000 * 12 + 1> starts{};
+  for (int i = 0; i < int(starts.size()); ++i)
+    starts[i] = days(i / 12, i % 12 + 1, 1);
+  return starts;
+}();
 constexpr ll bad_time = LLONG_MIN;
 ll timestamp(string_view s) {
   if (s.size() < 5 || s[4] != '-') {
+    if (!s.empty() && s.size() <= 18) {
+      ll result = 0;
+      for (unsigned char c : s) {
+        unsigned digit = c - '0';
+        if (digit > 9)
+          return bad_time;
+        result = 10 * result + digit;
+      }
+      return result;
+    }
     ll epoch_ms = number(s);
     return epoch_ms < 0 ? bad_time : epoch_ms;
   }
   if ((s.size() != 20 && s.size() != 25) || s[7] != '-' || s[10] != 'T' ||
       s[13] != ':' || s[16] != ':')
     return bad_time;
+  bool invalid_digits = false;
   auto pair_at = [&](int i) {
     unsigned a = static_cast<unsigned char>(s[i]) - '0';
     unsigned b = static_cast<unsigned char>(s[i + 1]) - '0';
-    return a <= 9 && b <= 9 ? int(a * 10 + b) : -1;
+    invalid_digits |= (a > 9) | (b > 9);
+    return a * 10 + b;
   };
-  int century = pair_at(0), year = pair_at(2), m = pair_at(5), d = pair_at(8),
+  unsigned century = pair_at(0), year = pair_at(2), m = pair_at(5), d = pair_at(8),
       h = pair_at(11), mi = pair_at(14), se = pair_at(17);
-  if ((century | year | m | d | h | mi | se) < 0)
+  if (invalid_digits || m < 1 || m > 12 || d < 1 || h > 23 || mi > 59 || se > 59)
     return bad_time;
-  int y = century * 100 + year;
-  int md[] = {0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-  if (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))
-    md[2] = 29;
-  if (m < 1 || m > 12 || d < 1 || d > md[m] || h > 23 || mi > 59 || se > 59)
+  unsigned month = (century * 100 + year) * 12 + m - 1;
+  int first = month_starts[month];
+  if (int(d) > month_starts[month + 1] - first)
     return bad_time;
   ll off = 0;
   if (s.size() == 20) {
     if (s[19] != 'Z')
       return bad_time;
   } else {
-    if ((s[19] != '+' && s[19] != '-') || s[22] != ':' ||
-        !digits(s.substr(20, 2)) || !digits(s.substr(23, 2)))
+    if ((s[19] != '+' && s[19] != '-') || s[22] != ':')
       return bad_time;
-    ll oh = number(s.substr(20, 2)), om = number(s.substr(23, 2));
-    if (oh > 23 || om > 59)
+    unsigned oh = pair_at(20), om = pair_at(23);
+    if (invalid_digits || oh > 23 || om > 59)
       return bad_time;
-    off = (oh * 60 + om) * 60000 * (s[19] == '+' ? 1 : -1);
+    off = ll(oh * 60 + om) * 60000 * (s[19] == '+' ? 1 : -1);
   }
-  return days(y, m, d) * DAY + (h * 3600 + mi * 60 + se) * 1000 - off;
+  return (ll(first) + d - 1) * DAY + (h * 3600 + mi * 60 + se) * 1000 - off;
 }
 bool csv(string_view line, vector<string_view> &out, int count) {
   out.clear();
