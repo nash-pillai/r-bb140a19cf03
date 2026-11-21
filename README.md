@@ -1,6 +1,6 @@
-# Shopping Sessions
+# Daily event aggregation
 
-An exact native pipeline for the Builders Buildathon Shopping Sessions track.
+An exact native pipeline for grouping events into sessions and attributing campaigns.
 
 The C++ core canonicalizes linked identities, parses event files in parallel, and partitions records by exact event ID. It selects the earliest ingested copy before dropping invalid events, then partitions surviving events and clicks by person so workers can build sessions and attribute campaigns in parallel. The Python conversion step writes both required Parquet tables with a DATE day column.
 
@@ -16,6 +16,8 @@ g++ -O3 -DNDEBUG -std=c++20 -o pipeline main.cpp
 ```
 
 Set DATA_DIR and OUTPUT_DIR to run on generated data. The container uses /data and /output by default.
+
+Build the default image with `docker build -t event-pipeline:latest .` before using `scripts/docker_run.sh`.
 
 The Docker image passed all 36 fixtures and exactly matched the official answers for one million events. On kevin-old, the C++ core processed 20 million events and five million clicks in 23.14 seconds. Both tables matched the serial implementation. That measurement excludes Parquet conversion.
 
