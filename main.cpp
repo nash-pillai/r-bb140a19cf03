@@ -89,6 +89,103 @@ ll timestamp(string_view s) {
   }
   return (ll(first) + d - 1) * DAY + (h * 3600 + mi * 60 + se) * 1000 - off;
 }
+// One decoder call returns both absolute event clocks. The two cached months
+// are hints from the manifest; an exact YYYY-MM- match is required for use.
+struct EventClocks {
+  struct Times { ll event, ingest; };
+  struct Month { uint64_t prefix; int length; ll origin; };
+  array<Month, 2> months{};
+
+  static Month month_for(ll ms) {
+    ll day = ms / DAY - (ms % DAY < 0);
+    if (day < days(0, 1, 1) || day > days(9999, 12, 31))
+      return {};
+    chrono::year_month_day date{chrono::sys_days{chrono::days{day}}};
+    int year = int(date.year()), month = unsigned(date.month());
+    int index = year * 12 + month - 1;
+    char prefix[12];
+    snprintf(prefix, sizeof(prefix), "%04d-%02d-", year, month);
+    uint64_t key;
+    memcpy(&key, prefix, sizeof(key));
+    return {key, month_starts[index + 1] - month_starts[index],
+            ll(month_starts[index]) * DAY};
+  }
+
+  EventClocks(ll start, ll end) : months{month_for(start), month_for(end - 1)} {}
+
+  using Decoder = Times (*)(const EventClocks &, string_view, string_view);
+  static Times scalar(const EventClocks &, string_view event, string_view ingest) {
+    return {timestamp(event), timestamp(ingest)};
+  }
+
+#if defined(__x86_64__)
+  __attribute__((target("ssse3,sse4.1")))
+  ll iso(string_view s) const {
+    if (s.size() != 20)
+      return timestamp(s);
+    const char *p = s.data();
+    uint64_t prefix;
+    memcpy(&prefix, p, sizeof(prefix));
+    const Month &m = prefix == months[0].prefix ? months[0] : months[1];
+    if (!m.length || prefix != m.prefix)
+      return timestamp(s);
+
+    // The final 16 bytes of F1 are -MM-DDTHH:MM:SSZ. XOR against
+    // the zero-digit template, then check every digit and separator lane.
+    const auto raw = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p + 4));
+    const auto pattern = _mm_setr_epi8('-','0','0','-','0','0','T','0',
+                                        '0',':','0','0',':','0','0','Z');
+    const auto caps = _mm_setr_epi8(0,9,9,0,9,9,0,9,9,0,9,9,0,9,9,0);
+    const auto digits = _mm_xor_si128(raw, pattern);
+    const auto bad_chars = _mm_subs_epu8(digits, caps);
+    const auto packed = _mm_shuffle_epi8(digits,
+        _mm_setr_epi8(4,5,7,8,10,11,13,14,-1,-1,-1,-1,-1,-1,-1,-1));
+    auto values = _mm_maddubs_epi16(packed, _mm_set1_epi16(0x010a));
+    // Convert the day to zero-based. Day zero wraps and fails the unsigned cap.
+    values = _mm_sub_epi16(values, _mm_cvtsi32_si128(1));
+    const auto bad_range = _mm_subs_epu16(values, _mm_setr_epi16(m.length-1,23,59,59,0,0,0,0));
+    const auto bad = _mm_or_si128(bad_chars, bad_range);
+    if (!_mm_testz_si128(bad, bad))
+      return bad_time;
+    const auto parts = _mm_madd_epi16(values, _mm_setr_epi16(1440,60,60,1,0,0,0,0));
+    int seconds = _mm_cvtsi128_si32(parts) * 60 + _mm_extract_epi32(parts, 1);
+    return m.origin + ll(seconds) * 1000;
+  }
+
+  __attribute__((target("ssse3,sse4.1")))
+  static ll epoch13(const char *p) {
+    const auto zero = _mm_set1_epi8('0');
+    const auto a = _mm_xor_si128(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(p)), zero);
+    const auto b = _mm_xor_si128(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(p+5)), zero);
+    // Three zero lanes, then the first five digits, then the final eight.
+    const auto digits = _mm_unpacklo_epi64(_mm_slli_si128(a, 3), b);
+    const auto bad = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+    if (!_mm_testz_si128(bad, bad))
+      return bad_time;
+    const auto pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+    const auto quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
+    const auto halves = _mm_madd_epi16(_mm_packs_epi32(quads, quads),
+                                        _mm_set1_epi32(0x00012710));
+    return ll(_mm_cvtsi128_si32(halves)) * 100000000 + _mm_extract_epi32(halves, 1);
+  }
+
+  __attribute__((target("ssse3,sse4.1")))
+  static Times packed(const EventClocks &clock, string_view event, string_view ingest) {
+    ll ts = event.size() == 13 ? epoch13(event.data()) : clock.iso(event);
+    return {ts, clock.iso(ingest)};
+  }
+#endif
+
+  static Decoder decoder() {
+#if defined(__x86_64__)
+    if (__builtin_cpu_supports("ssse3") && __builtin_cpu_supports("sse4.1"))
+      return packed;
+#endif
+    return scalar;
+  }
+};
+
+
 bool csv(string_view line, vector<string_view> &out, int count) {
   out.clear();
   size_t a = 0;
@@ -866,6 +963,8 @@ void process(const string &data, const string &out, ll start, ll end,
   using Event = EventRecord<Time, Purchase>;
   using Kept = KeptRecord<Event>;
   const IngestClock clock(start);
+  const EventClocks event_clocks(start, end);
+  const auto decode = EventClocks::decoder();
   // Valid events have already passed the half-open window check on absolute time.
   const ll origin = is_same_v<Time, uint32_t> ? start : 0;
   auto checkpoint = [&](const char *label) {
@@ -904,8 +1003,7 @@ void process(const string &data, const string &out, ll start, ll end,
       if (f[0].empty())
         return;
       const auto user_lookup = users.prepare_lookup(f[1]);
-      ll ingest = timestamp(f[3]);
-      ll ts = timestamp(f[2]);
+      auto [ts, ingest] = decode(event_clocks, f[2], f[3]);
       bool purchase = f[4] == "purchase";
       ll price = purchase ? number(f[6], 10000000) : 0;
       Event e;
