@@ -446,6 +446,77 @@ template <class Time> struct EventRecord {
   Time ts = 0;
   int user = -1, cat = 0, price = 0;
 };
+
+// A person group fixes the low bits of the user ID. Count only the user
+// slots belonging to this group, then scatter straight from the dedup batches.
+struct CompactEventOrder {
+  using Event = EventRecord<uint32_t>;
+  vector<size_t> ends;
+  vector<Event> ordered, scratch;
+
+  void order_times(span<Event> events) {
+    if (events.size() < 2)
+      return;
+    if (events.size() < 512) {
+      sort(events.begin(), events.end(),
+           [](const Event &a, const Event &b) { return a.ts < b.ts; });
+      return;
+    }
+    // Count all four bytes in one traversal. A constant byte needs no pass.
+    size_t counts[4][256]{};
+    for (const auto &event : events)
+      for (unsigned pass = 0; pass < 4; ++pass)
+        ++counts[pass][(event.ts >> (8 * pass)) & 255];
+    if (scratch.size() < events.size())
+      scratch.resize(events.size());
+    Event *src = events.data(), *dst = scratch.data();
+    for (unsigned pass = 0; pass < 4; ++pass) {
+      auto &offsets = counts[pass];
+      if (offsets[(src[0].ts >> (8 * pass)) & 255] == events.size())
+        continue;
+      exclusive_scan(begin(offsets), end(offsets), begin(offsets), size_t{0});
+      for (size_t i = 0; i < events.size(); ++i) {
+        auto digit = (src[i].ts >> (8 * pass)) & 255;
+        dst[offsets[digit]++] = src[i];
+      }
+      swap(src, dst);
+    }
+    if (src != events.data())
+      copy_n(src, events.size(), events.data());
+  }
+
+  span<Event> run(vector<Groups<Event>> &sources, size_t group, size_t users) {
+    size_t count = 0;
+    for (const auto &source : sources)
+      count += source[group].size();
+    size_t slots = group < users ? 1 + (users - 1 - group) / person_groups : 0;
+    if (count < 256 || slots > count) {
+      ordered = gather(sources, group);
+      sort(ordered.begin(), ordered.end(), [](const Event &a, const Event &b) {
+        auto key = [](const Event &e) { return (uint64_t(e.user) << 32) | e.ts; };
+        return key(a) < key(b);
+      });
+      return ordered;
+    }
+    ends.assign(slots, 0);
+    for (const auto &source : sources)
+      for (const auto &event : source[group])
+        ++ends[event.user / person_groups];
+    exclusive_scan(ends.begin(), ends.end(), ends.begin(), size_t{0});
+    ordered.resize(count);
+    for (auto &source : sources) {
+      for (const auto &event : source[group])
+        ordered[ends[event.user / person_groups]++] = event;
+      vector<Event>().swap(source[group]);
+    }
+    size_t first = 0;
+    for (auto last : ends) {
+      order_times(span(ordered).subspan(first, last - first));
+      first = last;
+    }
+    return ordered;
+  }
+};
 // Common event IDs have prefix e and up to eight suffix bytes. Store the
 // complete suffix in the key. Zero bytes and a set high bit take the exact
 // string path so the two key spaces cannot overlap.
@@ -786,19 +857,21 @@ void process(const string &data, const string &out, ll start, ll end,
     user_files.push_back(make_unique<DailyWriter>(
         part_name(out + "/user_daily", i).string() + ".tmp", true));
   atomic<size_t> valid_events{0};
+  vector<CompactEventOrder> compact_order(threads);
   parallel_jobs(person_groups, threads, [&](int worker, size_t group) {
-    auto events = gather(surviving, group);
+    auto events = [&] {
+      if constexpr (is_same_v<Time, uint32_t>)
+        return compact_order[worker].run(surviving, group, users.names.size());
+      else {
+        auto batch = gather(surviving, group);
+        sort(batch.begin(), batch.end(), [](const Event &a, const Event &b) {
+          return tie(a.user, a.ts) < tie(b.user, b.ts);
+        });
+        return batch;
+      }
+    }();
     auto clicks = gather(click_batches, group);
     valid_events.fetch_add(events.size(), memory_order_relaxed);
-    sort(events.begin(), events.end(),
-         [](const Event &a, const Event &b) {
-           if constexpr (is_same_v<Time, uint32_t>) {
-             auto key = [](const Event &e) { return (uint64_t(e.user) << 32) | e.ts; };
-             return key(a) < key(b);
-           } else {
-             return tie(a.user, a.ts) < tie(b.user, b.ts);
-           }
-         });
     sort(clicks.begin(), clicks.end(), [&](auto &a, auto &b) {
       if (a.user != b.user)
         return a.user < b.user;
